@@ -16,12 +16,15 @@ on:
         options:
           - debug
           - release
+          - both
 
 jobs:
   build:
     name: Build APK
     runs-on: ubuntu-latest
     outputs:
+      # hashFiles() only works at step level — the detect step below sets
+      # this and release-sign reads it via needs.build.outputs.
       has_signing: ${{ steps.signing_detect.outputs.has_signing }}
 
     steps:
@@ -43,14 +46,11 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
-      - name: Set up Flutter
-        uses: subosito/flutter-action@v2
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
         with:
-          flutter-version: 'stable'
-          cache: true
-
-      - name: Get Flutter dependencies
-        run: flutter pub get
+          gradle-version: '9.3.1'
+          validate-wrappers: false
 
       - name: Configure Environment Secrets (.env)
         run: |
@@ -59,14 +59,26 @@ jobs:
             cp .env.example .env
           fi
 
+      - name: Ensure Debug Keystore Exists
+        run: |
+          if [ -f "debug.keystore.base64" ]; then
+            echo "Decoding debug.keystore from base64..."
+            base64 -d debug.keystore.base64 > debug.keystore
+          elif [ ! -f "debug.keystore" ]; then
+            echo "Generating fallback debug.keystore..."
+            keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
       - name: Build Android APK
         run: |
           BUILD_TYPE="${{ github.event.inputs.build_type || 'debug' }}"
           echo "Building APK with target: $BUILD_TYPE"
           if [ "$BUILD_TYPE" == "release" ]; then
-            flutter build apk --release --split-per-abi
+            gradle assembleRelease --stacktrace
+          elif [ "$BUILD_TYPE" == "both" ]; then
+            gradle assembleDebug assembleRelease --stacktrace
           else
-            flutter build apk --debug
+            gradle assembleDebug --stacktrace
           fi
 
       - name: Upload APK Artifacts
@@ -74,20 +86,27 @@ jobs:
         with:
           name: ${{ github.event.repository.name }}-APK-${{ github.run_number }}
           path: |
-            build/app/outputs/apk/**/*.apk
+            app/build/outputs/apk/**/*.apk
+            .build-outputs/*.apk
+            *.apk
           retention-days: 90
 
       - name: Create GitHub Release & Attach APK (On Tag Push Only)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: build/app/outputs/apk/**/*.apk
+          files: |
+            app/build/outputs/apk/**/*.apk
+            .build-outputs/*.apk
+            *.apk
           generate_release_notes: true
           name: Release ${{ github.ref_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   release-sign:
+    # Signed release APK — runs only when APK Builder pushed a signing
+    # keystore (signing/release.keystore.b64 + signing/signing.properties).
     name: Sign release APK
     runs-on: ubuntu-latest
     needs: build
@@ -103,26 +122,23 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
-      - name: Set up Flutter
-        uses: subosito/flutter-action@v2
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
         with:
-          flutter-version: 'stable'
-          cache: true
-
-      - name: Get Flutter dependencies
-        run: flutter pub get
+          gradle-version: '9.3.1'
+          validate-wrappers: false
 
       - name: Decode signing keystore
         run: base64 -d signing/release.keystore.b64 > /tmp/release.keystore
 
       - name: Build release APK
-        run: flutter build apk --release --split-per-abi
+        run: gradle assembleRelease --stacktrace
 
       - name: Sign release APK
         run: |
           BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort | tail -1)"
-          IN="$(ls build/app/outputs/apk/release/*arm64-v8a*.apk 2>/dev/null | head -1)"
-          if [ -z "$IN" ]; then IN="$(ls build/app/outputs/apk/release/*.apk | head -1)"; fi
+          IN="$(ls app/build/outputs/apk/release/*unsigned*.apk 2>/dev/null | head -1)"
+          if [ -z "$IN" ]; then IN="$(ls app/build/outputs/apk/release/*.apk | head -1)"; fi
           "$BT/apksigner" sign \
             --ks /tmp/release.keystore \
             --ks-pass "pass:$(grep '^storePassword=' signing/signing.properties | cut -d= -f2-)" \
